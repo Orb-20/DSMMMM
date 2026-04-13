@@ -1,0 +1,11 @@
+{
+  "annual_return": 0.145982,
+  "annual_volatility": 0.137688,
+  "sharpe_ratio": 0.6971,
+  "sortino_ratio": 1.1631,
+  "var_95_daily": -0.013992,
+  "diversification_ratio": 1.782,
+  "n_assets": 20,
+  "n_clusters": 6,
+  "optimization_status": "optimal"
+}

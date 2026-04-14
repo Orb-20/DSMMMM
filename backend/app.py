@@ -5,7 +5,7 @@ import os
 import json
 import numpy as np
 import pandas as pd
-from flask import Flask, jsonify, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
 # Add project root to path
@@ -135,12 +135,15 @@ def run_pipeline():
     pos = nx.spring_layout(G_filtered, seed=42, weight="weight", k=2.0)
     graph_nodes = []
     for node in G_filtered.nodes():
+        idx = tickers.index(node)
         graph_nodes.append({
             "id": node,
             "x": round(float(pos[node][0]), 4),
             "y": round(float(pos[node][1]), 4),
             "cluster": cluster_map.get(node, 0),
-            "weight": round(float(final_weights[tickers.index(node)]), 6),
+            "weight": round(float(final_weights[idx]), 6),
+            "annual_return": round(float(mu[idx]) * 252, 4),
+            "annual_vol": round(float(np.sqrt(Sigma[idx, idx]) * np.sqrt(252)), 4),
         })
 
     # Cluster details
@@ -205,6 +208,15 @@ def run_pipeline():
         })
 
     _cache.update({
+        # ── Non-serializable raw arrays (kept server-side for /api/optimize, /api/path) ──
+        "_mu": mu,
+        "_Sigma": Sigma,
+        "_R": R,
+        "_tickers": tickers,
+        "_G_full": G_full,
+        "_G_filtered": G_filtered,
+        "_cluster_map": cluster_map,
+        # ── Serializable ──
         "metrics": metrics,
         "weights": weights_data,
         "clusters": cluster_details,
@@ -290,7 +302,187 @@ def api_portfolio_history():
 @app.route("/api/all")
 def api_all():
     data = run_pipeline()
-    return jsonify(data)
+    # Strip non-serializable private keys (raw arrays / nx graphs).
+    return jsonify({k: v for k, v in data.items() if not k.startswith("_")})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dynamic optimization — re-solves Markowitz with user-controlled parameters.
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route("/api/optimize", methods=["POST"])
+def api_optimize():
+    """Re-run the QP with user-tuned knobs.
+
+    Body: {
+        "risk_aversion": float > 0,   # lambda. Higher => more risk-averse.
+        "max_weight":    float in (0,1] or null,
+        "allow_short":   bool,
+        "target_return": float | null  # optional override
+    }
+    """
+    body = request.get_json(silent=True) or {}
+    lam         = float(body.get("risk_aversion", 1.0))
+    max_weight  = body.get("max_weight")
+    allow_short = bool(body.get("allow_short", False))
+    target_ret  = body.get("target_return")
+
+    data  = run_pipeline()
+    mu    = data["_mu"]
+    Sigma = data["_Sigma"]
+    R     = data["_R"]
+    tickers = data["_tickers"]
+    n = len(mu)
+
+    import cvxpy as cp
+    w = cp.Variable(n)
+    constraints = [cp.sum(w) == 1]
+    if not allow_short:
+        constraints.append(w >= 0)
+    if max_weight is not None and 0 < float(max_weight) <= 1:
+        constraints.append(w <= float(max_weight))
+    if target_ret is not None:
+        constraints.append(mu @ w >= float(target_ret))
+
+    # Mean-variance utility: max  μ'w − (λ/2) w'Σw   ⇔   min  (λ/2) w'Σw − μ'w
+    objective = cp.Minimize(0.5 * lam * cp.quad_form(w, cp.psd_wrap(Sigma)) - mu @ w)
+    problem = cp.Problem(objective, constraints)
+
+    weights = None
+    status = "failed"
+    for solver in [cp.OSQP, cp.ECOS, cp.SCS]:
+        try:
+            problem.solve(solver=solver, warm_start=True)
+            if problem.status in ("optimal", "optimal_inaccurate") and w.value is not None:
+                weights = np.clip(w.value, 0 if not allow_short else -1, 1)
+                weights = weights / weights.sum()
+                status = problem.status
+                break
+        except Exception:
+            continue
+
+    if weights is None:
+        weights = np.ones(n) / n
+        status = "equal_weight_fallback"
+
+    port_ret = float(mu @ weights) * 252
+    port_var = float(weights @ Sigma @ weights)
+    port_std = float(np.sqrt(port_var) * np.sqrt(252))
+    sharpe   = (port_ret - RISK_FREE_RATE) / port_std if port_std > 1e-9 else 0.0
+
+    # Portfolio path-through-time under these new weights
+    port_returns = R @ weights
+    cum = np.cumprod(1 + port_returns)
+    dates = list(data["portfolio_history"])  # already has dates at weekly cadence
+    hist = [{"date": dates[i]["date"], "value": round(float(cum[i * 5]) * 10000, 2)}
+            for i in range(min(len(dates), len(cum) // 5))]
+
+    return jsonify({
+        "status": status,
+        "risk_aversion": lam,
+        "weights": [
+            {"ticker": t, "weight": round(float(weights[i]), 6)}
+            for i, t in enumerate(tickers)
+        ],
+        "metrics": {
+            "annual_return":     round(port_ret, 4),
+            "annual_volatility": round(port_std, 4),
+            "sharpe_ratio":      round(sharpe, 4),
+            "variance":          round(port_var, 8),
+        },
+        "portfolio_history": hist,
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Graph-path endpoint. Three algorithms mapped to risk appetites:
+#   dijkstra → lowest-correlation safe path (risk-averse)
+#   mst      → broad diversification tour (balanced)
+#   maxflow  → highest-throughput aggressive path (max return per unit flow)
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route("/api/path")
+def api_path():
+    algo   = request.args.get("algo", "dijkstra").lower()
+    source = request.args.get("source")
+    target = request.args.get("target")
+
+    data = run_pipeline()
+    G = data["_G_full"]
+    G_mst = data["_G_filtered"]
+    tickers = data["_tickers"]
+    mu = data["_mu"]
+    Sigma = data["_Sigma"]
+    weights = np.array([next(
+        (w["weight"] for w in data["weights"] if w["ticker"] == t), 0.0
+    ) for t in tickers])
+
+    # Default source/target: highest-return ↔ lowest-return tickers
+    if not source or source not in tickers:
+        source = tickers[int(np.argmax(mu))]
+    if not target or target not in tickers:
+        target = tickers[int(np.argmin(mu))]
+
+    path_nodes = []
+    path_info = {"algo": algo, "source": source, "target": target}
+
+    try:
+        if algo == "dijkstra":
+            # Min total distance (low correlation = low cost = diversified path).
+            path_nodes = nx.shortest_path(G, source=source, target=target, weight="weight")
+            total_cost = nx.shortest_path_length(G, source=source, target=target, weight="weight")
+            path_info["total_distance"] = round(float(total_cost), 4)
+
+        elif algo == "mst":
+            # Walk the MST from source to target — broad diversification tour.
+            path_nodes = nx.shortest_path(G_mst, source=source, target=target)
+            total_cost = sum(G_mst[path_nodes[i]][path_nodes[i + 1]]["weight"]
+                             for i in range(len(path_nodes) - 1))
+            path_info["total_distance"] = round(float(total_cost), 4)
+
+        elif algo == "maxflow":
+            # Highest-return aggressive route: reweight edges by 1/(μ_u+μ_v) so the
+            # shortest path picks high-return stepping stones, then report cumulative μ.
+            G_ret = nx.Graph()
+            for u, v, d in G.edges(data=True):
+                iu, iv = tickers.index(u), tickers.index(v)
+                # Edge cost inversely proportional to (expected) return — more μ ⇒ cheaper.
+                avg_mu = max(float(mu[iu] + mu[iv]) / 2, 1e-6)
+                G_ret.add_edge(u, v, weight=1.0 / avg_mu)
+            path_nodes = nx.shortest_path(G_ret, source=source, target=target, weight="weight")
+            path_info["cumulative_return"] = round(
+                float(sum(mu[tickers.index(t)] for t in path_nodes)) * 252, 4
+            )
+        else:
+            return jsonify({"error": f"unknown algo '{algo}'"}), 400
+
+    except nx.NetworkXNoPath:
+        return jsonify({"error": "no path between source and target"}), 404
+    except nx.NodeNotFound as e:
+        return jsonify({"error": str(e)}), 404
+
+    # Ordered node details + edges
+    path_detail = []
+    for t in path_nodes:
+        idx = tickers.index(t)
+        path_detail.append({
+            "ticker": t,
+            "weight": round(float(weights[idx]), 6),
+            "annual_return": round(float(mu[idx]) * 252, 4),
+            "annual_vol":    round(float(np.sqrt(Sigma[idx, idx]) * np.sqrt(252)), 4),
+            "cluster": data["_cluster_map"].get(t, 0),
+        })
+    path_edges = []
+    G_src = G if algo == "dijkstra" else (G_mst if algo == "mst" else G)
+    for i in range(len(path_nodes) - 1):
+        u, v = path_nodes[i], path_nodes[i + 1]
+        if G_src.has_edge(u, v):
+            path_edges.append({
+                "source": u, "target": v,
+                "distance": round(float(G_src[u][v]["weight"]), 4),
+            })
+
+    path_info["nodes"] = path_detail
+    path_info["edges"] = path_edges
+    return jsonify(path_info)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,40 @@
+/* ─────────────────────────────────────────────────────────────
+   ORBE — Design tokens (matches existing HTML palette exactly)
+   ───────────────────────────────────────────────────────────── */
+:root {
+  --green-deep:   #1a3a1a;
+  --green-forest: #2d5016;
+  --green-mid:    #3d6b24;
+  --green-sage:   #6b8f4e;
+  --green-light:  #8ba872;
+  --green-pale:   #c8dbb0;
+
+  --beige-dark:   #b8a88c;
+  --beige:        #d4c5a9;
+  --beige-light:  #e8dcc8;
+
+  --cream:        #f5f0e8;
+  --cream-light:  #faf7f0;
+  --cream-white:  #fffcf5;
+
+  --brown-dark:   #2c2c1e;
+
+  --gold:         #b8a04e;
+  --gold-light:   #d4c070;
+
+  --red-muted:    #a85a4a;
+  --blue-muted:   #4a6a8a;
+
+  --font-display: 'Playfair Display', serif;
+  --font-body:    'DM Sans', sans-serif;
+  --font-mono:    'JetBrains Mono', monospace;
+
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 20px;
+
+  --shadow-sm: 0 4px 16px rgba(44, 44, 30, 0.04);
+  --shadow-md: 0 8px 32px rgba(44, 44, 30, 0.06);
+  --shadow-lg: 0 12px 36px rgba(44, 44, 30, 0.08);
+}
